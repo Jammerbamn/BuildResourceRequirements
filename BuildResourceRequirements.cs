@@ -2,34 +2,40 @@
 using BepInEx.Configuration;
 using HarmonyLib;
 using System.Collections.Generic;
+using System.Threading.Tasks;
 using TMPro;
 using UnityEngine;
+using UnityEngine.UI;
 using ServerSync;
 
 namespace BuildResourcesModNamespace
 {
-    [BepInPlugin("Jammerbam.buildresourcesmod", "Build Resources Mod", "1.0.0")]
+    [BepInPlugin("Jammerbam.buildresourcesmod", "Build Resources Mod", "1.1.0")]
     public class BuildResourcesMod : BaseUnityPlugin
     {
         private static BuildResourcesMod Instance;
         private static ConfigSync configSync = new ConfigSync("BuildResourcesMod")
         {
             DisplayName = "Build Resources Mod",
-            CurrentVersion = "1.0.0",
-            MinimumRequiredVersion = "1.0.0",
+            CurrentVersion = "1.1.0",
+            MinimumRequiredVersion = "1.1.0",
             IsLocked = true,
             ModRequired = true
         };
 
         private Dictionary<GameObject, string> PieceToTableMap = new Dictionary<GameObject, string>();
         private Dictionary<string, PieceTable> CachedPieceTables = new Dictionary<string, PieceTable>();
+        private Dictionary<Piece, Dictionary<string, int>> OriginalResourceCache = new Dictionary<Piece, Dictionary<string, int>>();
+        private ConfigEntry<bool> EnableLogging;
         private Dictionary<string, SyncedConfigEntry<bool>> CategoryConfigs = new Dictionary<string, SyncedConfigEntry<bool>>();
         private SyncedConfigEntry<string> Exceptions;
-        private ConfigEntry<bool> EnableLogging;
+        private SyncedConfigEntry<bool> EnableSkillBasedReduction;
+        private SyncedConfigEntry<bool> EnableFreeBuildAtMaxSkill;
 
         private HashSet<string> ExceptionPieces = new HashSet<string>();
         private bool LastChecked;
         private string LastPiece;
+        private bool NoCost;
 
 
         public static void Dbgl(string message, bool pref = true)
@@ -37,6 +43,14 @@ namespace BuildResourcesModNamespace
             if (Instance?.EnableLogging?.Value == true)
             {
                 Debug.Log((pref ? "[BuildResourcesMod] " : "") + message);
+            }
+        }
+
+        public static void Dbglw(string message, bool pref = true)
+        {
+            if (Instance?.EnableLogging?.Value == true)
+            {
+                Debug.LogWarning((pref ? "[BuildResourcesMod] " : "") + message);
             }
         }
         
@@ -48,6 +62,8 @@ namespace BuildResourcesModNamespace
             // Initialize core configurations
             EnableLogging = Config.Bind("Debug", "EnableLogging", false, "Enable detailed logging for debugging.");
             Dbgl($"Initialized EnableLogging: {EnableLogging.Value}");
+            EnableSkillBasedReduction = configSync.AddConfigEntry(Config.Bind("Features", "EnableSkillBasedReduction", false, "Enable resource cost reduction based on crafting skill."));
+            EnableFreeBuildAtMaxSkill = configSync.AddConfigEntry(Config.Bind("Features", "EnableFreeBuildAtMaxSkill", true, "Allow free building when the player has maximum crafting skill."));
 
             AddCategoryConfig("Misc", "Require resources for Misc category.", true);
             AddCategoryConfig("Crafting", "Require resources for Crafting category.", true);
@@ -96,6 +112,11 @@ namespace BuildResourcesModNamespace
             Dbgl("World initialization complete. Performing post-load routines.");
             HandleCategories();
             CachePieceTables();
+
+            yield return new WaitUntil(() => Player.m_localPlayer != null);
+
+            Dbgl("Local Player has loaded, applying resource reduction");
+            BuildResourcesMod.Instance.StartCoroutine(BuildResourcesMod.Instance.ApplyResourceReductions());
         }
 
         private System.Collections.IEnumerator WaitForConfigSync()
@@ -106,7 +127,7 @@ namespace BuildResourcesModNamespace
             var initialSyncDoneProperty = AccessTools.Property(configSync.GetType(), "InitialSyncDone");
             if (initialSyncDoneProperty == null)
             {
-                Dbgl("Error: Unable to find InitialSyncDone property.");
+                Dbglw("Error: Unable to find InitialSyncDone property.");
                 yield break;
             }
 
@@ -151,10 +172,12 @@ namespace BuildResourcesModNamespace
             Dbgl($"Final list of exception pieces: {string.Join(", ", ExceptionPieces)}");
         } 
 
+
         private void CachePieceTables()
         {
             CachedPieceTables.Clear();
             PieceToTableMap.Clear();
+            OriginalResourceCache.Clear();
 
             foreach (var pieceTable in Resources.FindObjectsOfTypeAll<PieceTable>())
             {
@@ -167,8 +190,25 @@ namespace BuildResourcesModNamespace
                     {
                         if (pieceObject != null && !PieceToTableMap.ContainsKey(pieceObject))
                         {
-                            PieceToTableMap[pieceObject] = pieceTable.name;
-                            Dbgl($" - Piece: {pieceObject.name} belongs to PieceTable: {pieceTable.name}");
+                            Piece piece = pieceObject.GetComponent<Piece>();
+                            if (piece != null)
+                            {
+                                PieceToTableMap[pieceObject] = pieceTable.name;
+                                Dbgl($" - Piece: {pieceObject.name} belongs to PieceTable: {pieceTable.name}");
+
+                                // Cache the original resource amounts
+                                var resourceAmounts = new Dictionary<string, int>();
+                                foreach (var req in piece.m_resources)
+                                {
+                                    if (req.m_resItem != null)
+                                    {
+                                        resourceAmounts[req.m_resItem.name] = req.m_amount;
+                                    }
+                                }
+
+                                OriginalResourceCache[piece] = resourceAmounts;
+                                Dbgl($"Cached original resources for piece: {piece.name}");
+                            }
                         }
                     }
                 }
@@ -176,7 +216,7 @@ namespace BuildResourcesModNamespace
 
             if (CachedPieceTables.Count == 0)
             {
-                Dbgl("No piece tables were found to cache.");
+                Dbglw("No piece tables were found to cache.");
             }
         }
 
@@ -264,6 +304,94 @@ namespace BuildResourcesModNamespace
         }
 
 
+        public System.Collections.IEnumerator ApplyResourceReductions()
+        {
+            if (OriginalResourceCache == null || Player.m_localPlayer == null) yield break;
+
+            // Hardcoded list of non-reducible pieces
+            HashSet<string> NonReduciblePieces = new HashSet<string>
+            {
+                "stone_pile",
+                "coal_pile",
+                "blackmarble_pile",
+                "grausten_pile",
+                "skull_pile",
+                "treasure_pile",
+                "wood_stack",
+                "wood_fine_stack",
+                "wood_core_stack",
+                "wood_yggdrasil_stack",
+                "blackwood_stack",
+                "bone_stack",
+                "treasure_stack"
+            };
+
+            if (EnableSkillBasedReduction.Value)
+            {
+                float skillFactor = Player.m_localPlayer.GetSkillFactor(Skills.SkillType.Crafting);
+                Dbgl($"Applying resource reductions with coroutine. Current crafting skill factor: {skillFactor}");
+
+                int processedCount = 0;
+
+                foreach (var entry in OriginalResourceCache)
+                {
+                    Piece piece = entry.Key;
+                    var originalAmounts = entry.Value;
+
+                    // Check if the piece is in the non-reducible list
+                    string rawName = piece.name.Replace("(Clone)", "").Trim().ToLowerInvariant();
+                    if (NonReduciblePieces.Contains(rawName))
+                    {
+                        Dbgl($"Skipping resource reduction for non-reducible piece: {piece.name}");
+                        continue;
+                    }
+
+                    foreach (var req in piece.m_resources)
+                    {
+                        if (req.m_resItem == null) continue;
+
+                        if (originalAmounts.TryGetValue(req.m_resItem.name, out int originalAmount))
+                        {
+                            // Reduce resource cost based on skill level
+                            int reducedAmount = Mathf.CeilToInt(originalAmount * (1.0f - skillFactor));
+                            if (!(req.m_amount == reducedAmount || req.m_amount == 1))
+                            {
+                                // Enforce a minimum value of 1 to prevent sprite disappearance
+                                req.m_amount = Mathf.Max(reducedAmount, 1);
+
+                                if (EnableFreeBuildAtMaxSkill.Value && Mathf.Approximately(skillFactor, 1.0f))
+                                {
+                                    NoCost = true; // Free building for max skill
+                                    req.m_amount = 1; // Keep the sprite visible by setting to at least 1
+                                }
+                                else
+                                {
+                                    NoCost = false;
+                                }
+
+                                Dbgl($"Updated resource {req.m_resItem.name} for piece {piece.name} from: {originalAmount} to: {req.m_amount}");
+                            }
+                        }
+                    }
+
+                    processedCount++;
+
+                    // Yield every 5 pieces to allow frame updates
+                    if (processedCount % 5 == 0)
+                    {
+                        yield return null;
+                    }
+                }
+                Dbgl("Resource reductions applied successfully.");
+            }
+            else
+            {
+                Dbgl("Resource reduction config set to false.");
+            }
+        }
+
+
+
         private bool ShouldRequireResources(Piece piece)
         {
             if (LastPiece == piece.name)
@@ -273,7 +401,7 @@ namespace BuildResourcesModNamespace
 
             if (piece == null)
             {
-                Dbgl("Piece is null in ShouldRequireResources check.");
+                Dbglw("Piece is null in ShouldRequireResources check.");
                 LastPiece = piece.name;
                 LastChecked = true;
                 return true; // Default to requiring resources if piece is null
@@ -326,7 +454,7 @@ namespace BuildResourcesModNamespace
                 return config.Value;
             }
 
-            Dbgl($"Piece '{piece.name}' in category '{category}' has no specific configuration. Defaulting to require resources.");
+            Dbglw($"Piece '{piece.name}' in category '{category}' has no specific configuration. Defaulting to require resources.");
             LastPiece = piece.name;
             LastChecked = true;
             return true;
@@ -353,6 +481,10 @@ namespace BuildResourcesModNamespace
                     {
                         Dbgl($"Skipping resource consumption for piece '{currentPiece.m_name}(Token Name)' in category '{currentPiece.m_category}' (mod setting).");
                         return false; // Skip the default resource consumption logic
+                    }
+                    if (BuildResourcesMod.Instance.NoCost)
+                    {
+                        return false; //Skip consumption if player has maxed crafting skill
                     }
                 }
 
@@ -400,19 +532,17 @@ namespace BuildResourcesModNamespace
                     __result = false;
                     return false; // Block placement if the required DLC is not installed
                 }
-                //FreeBuildKey check
-                if (mode != Player.RequirementMode.IsKnown && ZoneSystem.instance.GetGlobalKey(piece.FreeBuildKey()))
-                {
-                    __result = true;
-                    return false;
-                }
 
                 // Check if the piece requires resources
-                if  (mode != Player.RequirementMode.IsKnown && !BuildResourcesMod.Instance.ShouldRequireResources(piece))
+                if  (mode != Player.RequirementMode.IsKnown)
                 {
-                    __result = true;
-                    return false; // Simulate having the requirements
+                    if (!BuildResourcesMod.Instance.ShouldRequireResources(piece) || BuildResourcesMod.Instance.NoCost || ZoneSystem.instance.GetGlobalKey(piece.FreeBuildKey()))
+                    {
+                        __result = true;
+                        return false; // Simulate having the requirements
+                    }
                 }
+
 
                 // Fall back to the original method's logic for resource checks
                 return true;
@@ -454,18 +584,95 @@ namespace BuildResourcesModNamespace
                 for (int j = 0; j < piece.m_resources.Length; j++)
                 {
                     Piece.Requirement req = piece.m_resources[j];
+                    if (req.m_resItem == null) continue;
 
-                    if (req.m_resItem != null && !BuildResourcesMod.Instance.ShouldRequireResources(piece))
-                    {
                         // Find the resource amount text element
                         GameObject resourceSlot = __instance.m_requirementItems[j];
-                        TMP_Text component3 = resourceSlot.transform.Find("res_amount")?.GetComponent<TMP_Text>();
-                        
-                        if (component3 != null)
+                        TMP_Text amountText = resourceSlot.transform.Find("res_amount")?.GetComponent<TMP_Text>();
+                        Image icon = resourceSlot.transform.Find("res_icon")?.GetComponent<Image>();
+
+                    // Check if resources are not required
+                    if (BuildResourcesMod.Instance.NoCost)
+                    {
+                        if (amountText != null && icon != null)
                         {
-                            component3.color = Color.white; // Always display resource amounts in white
+                            amountText.color = Color.green; // Display resource number in green
+                            amountText.text = "0"; // Ensure the text explicitly shows 0
+                            icon.enabled = true;
                         }
                     }
+                    else if (!BuildResourcesMod.Instance.ShouldRequireResources(piece))
+                    {
+                        if (amountText != null && icon != null)
+                        {
+                            amountText.color = Color.green; //Display resource number in white
+                            icon.enabled = true;
+                        }
+                    }
+                }
+            }
+        }
+
+
+
+        //Crafting skill and resource reduction handling
+
+
+        [HarmonyPatch(typeof(Player), "OnSkillLevelup")]
+        public static class SkillChangePatch
+        {
+            [HarmonyPostfix]
+            public static void Postfix(Skills __instance, Skills.SkillType skill, float level)
+            {
+                if (skill != Skills.SkillType.Crafting || BuildResourcesMod.Instance == null) return;
+
+                Dbgl($"Crafting skill updated. Recalculating resources for all cached pieces.");
+                BuildResourcesMod.Instance.StartCoroutine(BuildResourcesMod.Instance.ApplyResourceReductions());
+            }
+        }
+
+        [HarmonyPatch(typeof(Skills), "LowerAllSkills")]
+        public static class SkillReductionPatch
+        {
+            [HarmonyPostfix]
+            public static void Postfix(Skills __instance, float factor)
+            {
+                if (BuildResourcesMod.Instance == null) return;
+
+                BuildResourcesMod.Dbgl($"All skills lowered by {factor * 100}%. Recalculating resources for all cached pieces.");
+                BuildResourcesMod.Instance.StartCoroutine(BuildResourcesMod.Instance.ApplyResourceReductions());
+            }
+        }
+
+
+        [HarmonyPatch(typeof(Skills), "CheatRaiseSkill")]
+        public static class CheatRaiseSkillPatch
+        {
+            [HarmonyPostfix]
+            public static void Postfix(Skills __instance, string name, float value, bool showMessage)
+            {
+                // Only trigger for the Crafting skill or "all"
+                if (name.ToLower() == "all" || name.ToLower() == Skills.SkillType.Crafting.ToString().ToLower())
+                {
+                    BuildResourcesMod.Dbgl($"Console command used to raise skill. Recalculating resources for all cached pieces.");
+                    BuildResourcesMod.Instance.StartCoroutine(BuildResourcesMod.Instance.ApplyResourceReductions());
+                }
+            }
+        }
+
+        [HarmonyPatch(typeof(Skills), "CheatResetSkill")]
+        public static class CheatResetSkillPatch
+        {
+            [HarmonyPostfix]
+            public static void Postfix(Skills __instance, string name)
+            {
+                if (BuildResourcesMod.Instance == null) return;
+
+                // Handle "all" or "Crafting" skill resets
+                if (name.ToLower() == "all" || name.ToLower() == Skills.SkillType.Crafting.ToString().ToLower())
+                {
+                    BuildResourcesMod.Dbgl($"Crafting skill reset via console command. Recalculating resources for all cached pieces.");
+                    BuildResourcesMod.Instance.StartCoroutine(BuildResourcesMod.Instance.ApplyResourceReductions());
                 }
             }
         }
