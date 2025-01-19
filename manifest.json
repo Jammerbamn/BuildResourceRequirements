@@ -1,0 +1,9 @@
+{
+    "name": "Build Resource Requirements",
+    "version_number": "1.1.0",
+    "website_url": "https://github.com/Jammerbamn/BuildResourceRequirements",
+    "description": "Mod to allow configurable resource requirements depending on the build category",
+    "dependencies": [
+        "denikson-BepInExPack_Valheim-5.4.2202"
+    ]
+}
