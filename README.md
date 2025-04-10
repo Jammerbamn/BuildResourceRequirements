@@ -74,5 +74,5 @@ This is my very first mod, and my first time coding in C#. There are things that
 ## Credits
 Almost all of the code was written by me however the config syncing is powered by:
 https://github.com/blaxxun-boop/ServerSync
-
+## Test Text 2
 ## Test text
