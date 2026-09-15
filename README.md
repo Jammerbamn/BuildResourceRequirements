@@ -10,10 +10,32 @@
 - **Skill Based Resource Requirements:** Configurable option to reduce resource requirements depending on the players crafting skill level.
 - **Multiplayer Synchronization:** Ensures all players share the same configuration when connected to a multiplayer server.
 
+## Requirements
+- Valheim **1.0.x** (Unity 6). Older game versions (0.22x and earlier) need mod version 1.1.0.
+- **BepInExPack_Valheim 5.4.2350** or newer (BepInEx 5.4.23.5, Unity 6 aware).
+
 ## Installation
-1. Install **BepInEx**.
+1. Install **BepInEx** (BepInExPack_Valheim 5.4.2350+).
 2. Extract the `BuildResourcesMod.dll` into the `BepInEx/plugins` folder.
 3. Launch Valheim to generate the configuration file.
+
+## Building from source
+The project is an SDK-style csproj and builds with the .NET 8 SDK (no Visual Studio needed).
+[ServerSync](https://github.com/blaxxun-boop/ServerSync) is pulled in as a git submodule and compiled
+straight into the plugin, so clone with submodules:
+
+```bash
+git clone --recurse-submodules https://github.com/eoger/BuildResourceRequirements.git
+```
+
+or, in an existing checkout, `git submodule update --init`. Then:
+
+```bash
+dotnet build -c Release -p:GamePath="C:\Program Files (x86)\Steam\steamapps\common\Valheim"
+```
+
+`GamePath` defaults to the standard Steam location. `BepInExCore` defaults to `<GamePath>\BepInEx\core`
+and can be overridden the same way. The output is a single `bin/Release/BuildResourcesMod.dll`.
 
 ## Configuration
 The configuration file is generated in `BepInEx/config/Jammerbam.buildresourcesmod.cfg`.
@@ -27,6 +49,7 @@ CraftingRequiresResources = true
 FurnitureRequiresResources = false
 BuildingWorkbenchRequiresResources = false   (Build)
 BuildingStonecutterRequiresResources = false (Heavy Building)
+DeepNorthRequiresResources = false           (new in Valheim 1.0: the 67-degree steep roof/wall pieces)
 CultivatorRequiresResources = true
 HoeRequiresResources = true
 ```
@@ -52,7 +75,7 @@ The mod will detect modded categories and add them to the config file. These cat
 Currently, the way that modded categories are displayed in the config file is by a numerical value, which is assigned when it is loaded in the game.
 
 ```ini
-## Require resources for modded category: $category_9
+## Require resources for modded category: <label from the piece table>
 # Setting type: Boolean
 # Default value: true
 9RequiresResources = true
@@ -66,6 +89,15 @@ You can also use this same method to find the name of a piece to add it to excep
 
 ## Disclaimer
 This is my very first mod, and my first time coding in C#. There are things that will inevitably be broken as I haven't been able to test for all scenarios. Please report if anything goes wrong so I can fix it.
+
+## Changelog
+### 1.2.0
+- Updated for Valheim 1.0 (Unity 6). Rebuilt against the 1.0.7 game assemblies and BepInExPack_Valheim 5.4.2350.
+- Bundled ServerSync rebuilt for 1.0 (the old build crashed on load with a `MissingFieldException`).
+- Added the new **DeepNorth** build category to the config. Despite the name it contains the new 67-degree steep roof, wall and beam pieces, so it defaults to free like the other building tabs.
+- Modded category config descriptions now use the category label from the piece table instead of an unlocalized `$category_N` token.
+- Fixed a null reference when a piece could not be resolved while checking requirements.
+- Config version requirement raised to 1.2.0 so 1.1.0 clients are rejected by 1.2.0 servers (they would not work on Valheim 1.0 anyway).
 
 ## Planned Changes
 - Fix the naming scheme in the config to make it more user-friendly.
